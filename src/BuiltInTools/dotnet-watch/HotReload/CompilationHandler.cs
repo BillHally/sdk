@@ -3,34 +3,35 @@
 
 using System;
 using System.Collections.Generic;
+using System.Collections.Immutable;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
-using System.Reflection.Metadata;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Build.Locator;
 using Microsoft.CodeAnalysis;
-using Microsoft.CodeAnalysis.Emit;
+using Microsoft.CodeAnalysis.EditAndContinue;
 using Microsoft.CodeAnalysis.MSBuild;
 using Microsoft.CodeAnalysis.Text;
 using Microsoft.Extensions.Tools.Internal;
+using Microsoft.VisualStudio.Debugger.Contracts.EditAndContinue;
+
 
 namespace Microsoft.DotNet.Watcher.Tools
 {
     public class CompilationHandler
     {
-        private Task<(MSBuildWorkspace, Project)> _initializeTask;
-        private EmitBaseline _emitBaseline;
-
+        private static readonly SolutionActiveStatementSpanProvider NoActiveSpans = (_, _) => new(ImmutableArray<TextSpan>.Empty); 
+        private Task<(MSBuildWorkspace, IEditAndContinueWorkspaceService)> _initializeTask;
+        private bool _failedToInitialize;
         private readonly IReporter _reporter;
-        private readonly CompilationChangeMaker _compilationChangeMaker;
 
         public CompilationHandler(IReporter reporter)
         {
             _reporter = reporter;
-            _compilationChangeMaker = new CompilationChangeMaker(reporter);
         }
 
         public async ValueTask InitializeAsync(DotNetWatchContext context)
@@ -40,27 +41,21 @@ namespace Microsoft.DotNet.Watcher.Tools
                 var instance = MSBuildLocator.QueryVisualStudioInstances().First();
 
                 _reporter.Verbose($"Using MSBuild at '{instance.MSBuildPath}' to load projects.");
-
-                // NOTE: Be sure to register an instance with the MSBuildLocator
-                //       before calling MSBuildWorkspace.Create()
-                //       otherwise, MSBuildWorkspace won't MEF compose.
                 MSBuildLocator.RegisterInstance(instance);
             }
             else if (_initializeTask is not null)
             {
-                _emitBaseline?.OriginalMetadata?.Dispose();
-                _emitBaseline = null;
-                
                 var (msw, project) = await _initializeTask;
                 msw.Dispose();
                 _initializeTask = null;
             }
 
-            if (context.FileSet.IsNetCoreApp31OrNewer) // needs to be net5.0
+            if (context.FileSet.IsNetCoreApp31OrNewer) // needs to be net6.0
             {
                 // Todo: figure this out for multi-project workspaces
                 var project = context.FileSet.First(f => f.FilePath.EndsWith(".csproj", StringComparison.Ordinal));
-                _initializeTask =  CreateMSBuildProject(project.FilePath, _reporter);
+                _initializeTask = CreateMSBuildProjectAsync(project.FilePath, _reporter);
+                await _initializeTask;
 
                 context.ProcessSpec.EnvironmentVariables["COMPLUS_ForceEnc"] = "1";
             }
@@ -76,117 +71,95 @@ namespace Microsoft.DotNet.Watcher.Tools
                 return false;
             }
 
-            var (_workspace, _project) = await _initializeTask;
+            var (workspace, editAndContinue) = await _initializeTask;
 
-            var possiblyChangedDocuments = new List<(CodeAnalysis.Document oldDoc, CodeAnalysis.Document newDoc)>();
-
-            // Read updated document
-            if (!string.IsNullOrEmpty(file.FilePath))
+            if (_failedToInitialize)
             {
-                
-                var documentToUpdate = _project.Documents.FirstOrDefault(d => d.FilePath == file.FilePath);
-                if (documentToUpdate != null)
-                {
-                    var text = await ReadFileTextWithRetry(file.FilePath);
-
-                    var updatedDocument = documentToUpdate.WithText(SourceText.From(text, Encoding.UTF8));
-                    var diff = await updatedDocument.GetTextChangesAsync(documentToUpdate);
-                    _reporter.Verbose(string.Join(" ", diff.Select(d => d.NewText)));
-                    possiblyChangedDocuments.Add((documentToUpdate, updatedDocument));
-                    _project = updatedDocument.Project;
-                }
+                return false;
             }
 
-            if (_emitBaseline is null)
+            var documentToUpdate = workspace.CurrentSolution.Projects.SelectMany(p => p.Documents).FirstOrDefault(d => d.FilePath == file.FilePath);
+            editAndContinue.StartEditSession(StubDebuggerService.Instance, out _);
+            if (documentToUpdate != null)
             {
-                var baselineMetadata = ModuleMetadata.CreateFromFile(_project.OutputFilePath);
-                _emitBaseline = EmitBaseline.CreateInitialBaseline(baselineMetadata, handle => default);
-            }
+                Console.WriteLine(documentToUpdate.GetTextSynchronously(default));
 
-            var semanticEdits = new List<SemanticEdit>();
-            foreach (var (oldDoc, newDoc) in possiblyChangedDocuments)
-            {
-                var changes = await _compilationChangeMaker.GetChanges(oldDoc, newDoc, cancellationToken);
-                if (changes.IsDefault)
+                var text = await ReadFileTextWithRetry(file.FilePath);
+
+                var updatedDocument = documentToUpdate.WithText(SourceText.From(text, Encoding.UTF8));
+
+                if (!workspace.TryApplyChanges(updatedDocument.Project.Solution))
                 {
-                    _reporter.Verbose("Rude edit detected.");
+                    _reporter.Verbose("Unable to apply changes.");
                     return false;
                 }
-                else
+            }
+
+            var (updates, diagnostics) = await editAndContinue.EmitSolutionUpdateAsync(workspace.CurrentSolution, NoActiveSpans, cancellationToken);
+
+            if (updates.Status != ManagedModuleUpdateStatus.Ready)
+            {
+                _reporter.Verbose("Unable to apply update.");
+                foreach (var diagnosticData in diagnostics)
                 {
-                    foreach (var change in changes)
-                    {
-                        semanticEdits.Add(change);
-                    }
-                }
-            }
-
-            if (!semanticEdits.Any())
-            {
-                _reporter.Verbose("No edits detected in the change");
-                return false;
-            }
-
-            using var metaStream = new MemoryStream();
-            using var ilStream = new MemoryStream();
-            using var pdbStream = new MemoryStream();
-            var updatedMethods = new List<MethodDefinitionHandle>();
-            var updatedCompilation = await _project.GetCompilationAsync();
-            var emitDifferenceResult = updatedCompilation.EmitDifference(_emitBaseline, semanticEdits, metaStream, ilStream, pdbStream, updatedMethods);
-            if (emitDifferenceResult.Baseline != null)
-            {
-                _emitBaseline = emitDifferenceResult.Baseline;
-            }
-
-            var diagnostics = emitDifferenceResult.Diagnostics;
-            if (diagnostics.Any())
-            {
-                foreach (var diagnostic in diagnostics)
-                {
-                    _reporter.Verbose(diagnostic.GetMessage());
+                    var project = workspace.CurrentSolution.GetProject(diagnosticData.ProjectId);
+                    var diagnostic = await diagnosticData.ToDiagnosticAsync(project, cancellationToken);
+                    _reporter.Verbose(diagnostic.ToString());
                 }
 
                 return false;
             }
 
-            var bytes = JsonSerializer.SerializeToUtf8Bytes(new UpdateDelta
+            editAndContinue.CommitSolutionUpdate();
+            editAndContinue.EndEditSession(out _);
+
+            var bytes = JsonSerializer.SerializeToUtf8Bytes(new UpdatePayload
             {
-                ModulePath = _emitBaseline.OriginalMetadata.Name,
-                MetaBytes = metaStream.ToArray(),
-                IlBytes = ilStream.ToArray(),
-                PdbBytes = pdbStream.ToArray(),
-            }, new JsonSerializerOptions(JsonSerializerDefaults.Web));
+                Deltas = updates.Updates.Select(c => new UpdateDelta
+                {
+                    ILDelta = c.ILDelta.ToArray(),
+                    MetadataDelta = c.MetadataDelta.ToArray(),
+                })
+            });
 
             await context.BrowserRefreshServer.SendMessage(bytes);
 
             return true;
         }
 
-        private static async Task<(MSBuildWorkspace, Project)> CreateMSBuildProject(string projectPath, IReporter reporter)
+        private async Task<(MSBuildWorkspace, IEditAndContinueWorkspaceService)> CreateMSBuildProjectAsync(string projectPath, IReporter reporter)
         {
-            reporter.Verbose($"Opening project at {projectPath}...");
             var msw = MSBuildWorkspace.Create();
 
             msw.WorkspaceFailed += (_sender, diag) =>
             {
-                var warning = diag.Diagnostic.Kind == WorkspaceDiagnosticKind.Warning;
-                if (!warning)
+                if (diag.Diagnostic.Kind == WorkspaceDiagnosticKind.Warning)
                 {
-                    reporter.Verbose($"msbuild failed opening project {projectPath}");
+                    reporter.Verbose($"MSBuildWorkspace warning: {diag.Diagnostic}");
                 }
-
-                reporter.Verbose($"MSBuildWorkspace {diag.Diagnostic.Kind}: {diag.Diagnostic.Message}");
-
-                if (!warning)
+                else
                 {
-                    throw new InvalidOperationException("failed workspace.");
+                    reporter.Warn($"Failed to create MSBuildWorkspace: {diag.Diagnostic}");
+                    _failedToInitialize = true;
                 }
             };
 
-            var project = await msw.OpenProjectAsync(projectPath);
-            await Parallel.ForEachAsync(project.Documents, default(CancellationToken), async (p, cts) => await p.GetTextAsync(cts));
+            var enc = msw.Services.GetRequiredService<IEditAndContinueWorkspaceService>();
+            await msw.OpenProjectAsync(projectPath);
+            enc.StartDebuggingSession(msw.CurrentSolution);
 
-            return (msw, project);
+            foreach (var project in msw.CurrentSolution.Projects)
+            {
+                foreach (var document in project.Documents)
+                {
+                    await document.GetTextAsync();
+                    await enc.OnSourceFileUpdatedAsync(document);
+                }
+            }
+
+            _failedToInitialize = false;
+
+            return (msw, enc);
         }
 
         private static async ValueTask<string> ReadFileTextWithRetry(string path)
@@ -198,24 +171,28 @@ namespace Microsoft.DotNet.Watcher.Tools
                     return File.ReadAllText(path);
                 }
                 // Presumably this is not the right way to handle this
-                catch (IOException ex) when (ex.Message.Contains("it is being used by another process"))
+                catch (IOException) when (attemptIndex < 8)
                 {
                     await Task.Delay(100);
                 }
             }
 
-            throw new InvalidOperationException($"Unabled to open {path} because it is in use");
+            Debug.Fail("This shouldn't happen.");
+            return null;
+        }
+
+        private readonly struct UpdatePayload
+        {
+            public string Type => "UpdateCompilation";
+
+            public IEnumerable<UpdateDelta> Deltas { get; init; }
         }
 
         private readonly struct UpdateDelta
         {
-            public string Type => "UpdateCompilation";
-
-            public string ModulePath { get; init;  }
-            public byte[] MetaBytes { get; init; }
-            public byte[] IlBytes { get; init; }
-
-            public byte[] PdbBytes { get; init; }
+            public string ModulePath { get; init; }
+            public byte[] MetadataDelta { get; init; }
+            public byte[] ILDelta { get; init; }
         }
     }
 }

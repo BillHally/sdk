@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0. See License.txt in the project root for license information.
 
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net.WebSockets;
@@ -15,29 +16,33 @@ internal class StartupHook
 
     public static void Initialize()
     {
-        // This method exists to make startup hook load successfully. We do not need to do anything interesting here.
-
+        // Ignore this
         _ = Task.Run(async () =>
         {
             var env = Environment.GetEnvironmentVariable("ASPNETCORE_AUTO_RELOAD_WS_ENDPOINT")!;
+
             var client = new ClientWebSocket();
             await client.ConnectAsync(new Uri(env), default);
             var buffer = new byte[4 * 1024 * 1024];
             while (client.State == WebSocketState.Open)
             {
+                Console.WriteLine("Waiting for message.");
                 var receive = await client.ReceiveAsync(buffer, default);
                 if (receive.CloseStatus is not null)
                 {
-                    System.Console.WriteLine(receive.CloseStatus);
+                    Console.WriteLine(receive.CloseStatus);
                     break;
                 }
 
-                UpdateDelta update;
+                Console.WriteLine("Message received.");
+
+
+                UpdatePayload update;
                 try
                 {
-                    update = JsonSerializer.Deserialize<UpdateDelta>(buffer.AsSpan(0, receive.Count), new JsonSerializerOptions { PropertyNameCaseInsensitive = true, PropertyNamingPolicy = JsonNamingPolicy.CamelCase });
+                    update = JsonSerializer.Deserialize<UpdatePayload>(buffer.AsSpan(0, receive.Count), new JsonSerializerOptions { PropertyNameCaseInsensitive = true, PropertyNamingPolicy = JsonNamingPolicy.CamelCase });
                 }
-                catch 
+                catch (Exception ex)
                 {
                     // Ignore these. It's probably a message for the browser.
                     continue;
@@ -50,7 +55,11 @@ internal class StartupHook
                 Console.WriteLine("Attempting to apply diff.");
                 try
                 {
-                    ApplyChangesToAssembly(update.ModulePath, update.MetaBytes, update.IlBytes);
+                    foreach (var item in update.Deltas)
+                    {
+                        _applyHotReloadUpdate(typeof(Program).Assembly, item.MetadataDelta, item.ILDelta, ReadOnlySpan<byte>.Empty);
+                    }
+
                     Console.WriteLine("Applied diff");
                 }
                 catch (Exception ex)
@@ -88,12 +97,17 @@ internal class StartupHook
 
     private delegate void ApplyUpdateDelegate(Assembly assembly, ReadOnlySpan<byte> metadataDelta, ReadOnlySpan<byte> ilDelta, ReadOnlySpan<byte> pdbDelta);
 
-    private struct UpdateDelta
+    private struct UpdatePayload
     {
         public string Type { get; set; }
 
+        public IEnumerable<UpdateDelta> Deltas { get; set; }
+    }
+
+    private struct UpdateDelta
+    {
         public string ModulePath { get; set; }
-        public byte[] MetaBytes { get; set; }
-        public byte[] IlBytes { get; set; }
+        public byte[] MetadataDelta { get; set; }
+        public byte[] ILDelta { get; set; }
     }
 }

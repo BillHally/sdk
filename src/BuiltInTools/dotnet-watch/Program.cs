@@ -75,6 +75,7 @@ Examples:
         public static async Task<int> Main(string[] args)
         {
             Console.WriteLine("dotnet-watch " + Environment.ProcessId);
+            Console.ReadLine();
 
             try
             {
@@ -209,7 +210,7 @@ Examples:
         private async Task<int> MainInternalAsync(
             IReporter reporter,
             string project,
-            IReadOnlyCollection<string> args,
+            IReadOnlyList<string> args,
             CancellationToken cancellationToken)
         {
             // TODO multiple projects should be easy enough to add here

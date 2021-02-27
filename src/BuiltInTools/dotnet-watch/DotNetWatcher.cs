@@ -33,6 +33,7 @@ namespace Microsoft.DotNet.Watcher
             _filters = new IWatchFilter[]
             {
                 new MSBuildEvaluationFilter(fileSetFactory),
+                new InitialBuildFilter(_processRunner),
                 new NoRestoreFilter(),
                 new LaunchBrowserFilter(dotNetWatchOptions),
             };
